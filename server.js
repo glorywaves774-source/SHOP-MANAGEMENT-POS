@@ -5,23 +5,81 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import { AsyncLocalStorage } from "node:async_hooks";
+import fs from "node:fs";
 
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
 const app=express(), PORT=process.env.PORT||3000;
 if(process.env.NODE_ENV==="production")app.set("trust proxy",1);
+// ---- Multi-tenant storage: a small master database lists the shops; every shop has its own SQLite file. ----
+// Code below keeps using `db`; it is a proxy that resolves to the database of the shop handling the current request.
 const DB_PATH=process.env.DATABASE_PATH||path.join(__dirname,"shop.db");
-const db=new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const DATA_DIR=process.env.DATA_DIR||path.dirname(DB_PATH);
+const TENANT_DIR=path.join(DATA_DIR,"shops");
+fs.mkdirSync(TENANT_DIR,{recursive:true});
+const master=new Database(path.join(DATA_DIR,"master.db"));
+master.pragma("journal_mode = WAL");
+master.exec(`CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY AUTOINCREMENT,slug TEXT UNIQUE NOT NULL,name TEXT NOT NULL,db_file TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),plan TEXT NOT NULL DEFAULT 'trial',trial_ends_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)`);
+const tenantStore=new AsyncLocalStorage();
+const db=new Proxy({},{get(_,k){const s=tenantStore.getStore();if(!s)throw new Error("No shop is selected for this request.");const v=s.db[k];return typeof v==="function"?v.bind(s.db):v}});
+const SLUG_RE=/^[a-z0-9][a-z0-9-]{2,29}$/,RESERVED_SLUGS=new Set(["admin","api","app","www","master","superadmin","support","login","signup","static","public","shopflow"]);
+const shopFile=shop=>path.isAbsolute(shop.db_file)?shop.db_file:path.join(TENANT_DIR,shop.db_file);
+const openShops=new Map(); // slug -> {db,slug,name}; least recently used closed beyond 100 open shops
+function openShop(shop,{init=true}={}){
+ let h=openShops.get(shop.slug);
+ if(h){openShops.delete(shop.slug);openShops.set(shop.slug,h);return h}
+ const d=new Database(shopFile(shop));d.pragma("journal_mode = WAL");d.pragma("foreign_keys = ON");
+ h={db:d,slug:shop.slug,name:shop.name};
+ if(init)tenantStore.run(h,()=>initTenantSchema());
+ openShops.set(shop.slug,h);
+ if(openShops.size>100){const [oldSlug,old]=openShops.entries().next().value;openShops.delete(oldSlug);try{old.db.close()}catch{}}
+ return h;
+}
+const findShop=slug=>SLUG_RE.test(String(slug||""))?master.prepare("SELECT * FROM shops WHERE slug=?").get(String(slug)):undefined;
 app.use(helmet({contentSecurityPolicy:false}));
 app.use(express.json({limit:"1mb"}));
 const safeDecode=v=>{try{return decodeURIComponent(v)}catch{return v}};
 app.use((req,res,next)=>{const raw=req.headers.cookie||"";req.cookies=Object.fromEntries(raw.split(";").map(v=>v.trim()).filter(v=>v.includes("=")).map(v=>{const i=v.indexOf("=");return [safeDecode(v.slice(0,i)),safeDecode(v.slice(i+1))]}));next();});
-app.use(express.static(path.join(__dirname,"public")));
+app.use(express.static(path.join(__dirname,"public"),{etag:true,setHeaders:(res,f)=>{if(/\.(js|html|css)$/.test(f))res.setHeader("Cache-Control","no-cache")}}));
 const loginLimiter=rateLimit({windowMs:15*60*1000,limit:10,skipSuccessfulRequests:true,standardHeaders:true,legacyHeaders:false,message:{error:"Too many login attempts. Try again later."}});
 const now=()=>new Date().toISOString();
 const hash=s=>crypto.createHash("sha256").update(s).digest("hex");
 const scrypt=(password,salt)=>crypto.scryptSync(password,salt,64).toString("hex");
+const accountId=code=>db.prepare('SELECT id FROM accounts WHERE code=?').get(code)?.id;
+const tenderAccountCode=method=>method==='Mobile Money'?'1020':method==='Bank Transfer'?'1010':method==='Card'?'1030':method==='Store Credit'?'2200':'1000';
+function postJournal({description,lines,sourceType=null,sourceId=null,entryDate=new Date().toISOString().slice(0,10),userId=null}){
+ const dateText=String(entryDate||'');const dateParts=/^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);const dateObj=dateParts?new Date(Date.UTC(Number(dateParts[1]),Number(dateParts[2])-1,Number(dateParts[3]))):null;if(!Array.isArray(lines)||!dateParts||dateObj.getUTCFullYear()!==Number(dateParts[1])||dateObj.getUTCMonth()+1!==Number(dateParts[2])||dateObj.getUTCDate()!==Number(dateParts[3]))throw new Error('A valid journal date and journal lines are required.');
+ const clean=lines.map(l=>{const rawDebit=Number(l.debit??0),rawCredit=Number(l.credit??0);if(!Number.isFinite(rawDebit)||!Number.isFinite(rawCredit))throw new Error('Journal amounts must be valid numbers.');return {account_id:Number(l.account_id||accountId(l.code)),description:l.description||description,debit:Math.round(rawDebit*100)/100,credit:Math.round(rawCredit*100)/100};}).filter(l=>l.debit>0||l.credit>0);
+ if(clean.length<2||clean.some(l=>!l.account_id||l.debit<0||l.credit<0||((l.debit>0)===(l.credit>0))||!db.prepare('SELECT id FROM accounts WHERE id=? AND active=1').get(l.account_id)))throw new Error('Journal lines must each use an active account and contain either a positive debit or a positive credit.');
+ const debit=Math.round(clean.reduce((n,l)=>n+l.debit,0)*100)/100,credit=Math.round(clean.reduce((n,l)=>n+l.credit,0)*100)/100;
+ if(Math.abs(debit-credit)>0.005||debit<=0)throw new Error('Journal entry is not balanced. Total debits must equal total credits.');
+ const entryNo='JE-'+Date.now().toString(36).toUpperCase()+'-'+crypto.randomBytes(2).toString('hex').toUpperCase();
+ const ins=db.prepare('INSERT INTO journal_entries(entry_no,entry_date,description,source_type,source_id,created_by) VALUES(?,?,?,?,?,?)').run(entryNo,entryDate,description,sourceType,sourceId,userId);
+ const lineIns=db.prepare('INSERT INTO journal_lines(entry_id,account_id,description,debit,credit) VALUES(?,?,?,?,?)');
+ clean.forEach(l=>lineIns.run(ins.lastInsertRowid,l.account_id,l.description,l.debit,l.credit));
+ return {id:ins.lastInsertRowid,entry_no:entryNo,total_debit:debit,total_credit:credit};
+}
+// Allocate a monetary total in cents without losing rounding cents.
+function allocateMoney(total, weights){
+ const cents=Math.round(Number(total||0)*100),sum=weights.reduce((a,b)=>a+Math.max(0,Number(b)||0),0);
+ if(!weights.length)return [];if(sum<=0)return weights.map((_,i)=>i===weights.length-1?cents/100:0);
+ let used=0;return weights.map((w,i)=>{const c=i===weights.length-1?cents-used:Math.round(cents*Math.max(0,Number(w)||0)/sum);used+=c;return c/100;});
+}
+const r2=n=>Math.round(n*100)/100;
+const PAYMENT_METHODS=["Cash","Mobile Money","Bank Transfer","Card"];
+const validQty=v=>{const n=Number(v);return Number.isFinite(n)?Math.floor(n):0};
+// Cash that physically entered/left the drawer for one shift: cash tendered on sales, later cash receipts, and cash refunds.
+function shiftCash(shiftId){
+ const sales=db.prepare("SELECT COALESCE(SUM(CASE WHEN tender_method IS NULL THEN (CASE WHEN payment_method='Cash' THEN total ELSE 0 END) WHEN tender_method='Cash' THEN MIN(initial_paid,total) ELSE 0 END),0) cash_sales,COUNT(*) transactions FROM sales WHERE shift_id=?").get(shiftId);
+ const receipts=db.prepare("SELECT COALESCE(SUM(amount),0) n FROM customer_payments WHERE shift_id=? AND method='Cash'").get(shiftId).n;
+ const refunds=db.prepare("SELECT COALESCE(SUM(r.total-r.receivable_offset),0) n FROM returns r LEFT JOIN sales s ON s.id=r.sale_id WHERE r.refund_method='Cash' AND COALESCE(r.shift_id,s.shift_id)=?").get(shiftId).n;
+ return {cash_sales:r2(sales.cash_sales),cash_receipts:r2(receipts),cash_refunds:r2(refunds),transactions:sales.transactions};
+}
+function ledgerBalances(){const rows=db.prepare("SELECT a.code,ROUND(COALESCE(SUM(l.debit-l.credit),0),2) signed FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id").all();return code=>Number(rows.find(a=>a.code===code)?.signed||0);}
+// Safe schema upgrades for databases created by earlier SHOPFLOW versions.
+const ensureColumn=(table,col,ddl)=>{if(!db.prepare(`PRAGMA table_info(${table})`).all().some(c=>c.name===col))db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`)};
+const cleanBarcode=v=>{const b=String(v??"").trim();return b||null};
+function initTenantSchema(){
 db.exec(`
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,sku TEXT UNIQUE,name TEXT NOT NULL,category TEXT DEFAULT 'General',price REAL NOT NULL DEFAULT 0,cost REAL NOT NULL DEFAULT 0,stock INTEGER NOT NULL DEFAULT 0,reorder_level INTEGER NOT NULL DEFAULT 5,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY AUTOINCREMENT,receipt_no TEXT UNIQUE,subtotal REAL NOT NULL,discount REAL DEFAULT 0,tax REAL DEFAULT 0,total REAL NOT NULL,payment_method TEXT NOT NULL,amount_paid REAL NOT NULL,change_due REAL DEFAULT 0,cashier TEXT DEFAULT 'Admin',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -82,44 +140,10 @@ const defaultAccounts=[
 ];
 const seedAccount=db.prepare('INSERT OR IGNORE INTO accounts(code,name,type,normal_balance,system_account) VALUES(?,?,?,?,1)');
 for(const a of defaultAccounts)seedAccount.run(...a);
-const accountId=code=>db.prepare('SELECT id FROM accounts WHERE code=?').get(code)?.id;
-const tenderAccountCode=method=>method==='Mobile Money'?'1020':method==='Bank Transfer'?'1010':method==='Card'?'1030':method==='Store Credit'?'2200':'1000';
-function postJournal({description,lines,sourceType=null,sourceId=null,entryDate=new Date().toISOString().slice(0,10),userId=null}){
- const dateText=String(entryDate||'');const dateParts=/^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);const dateObj=dateParts?new Date(Date.UTC(Number(dateParts[1]),Number(dateParts[2])-1,Number(dateParts[3]))):null;if(!Array.isArray(lines)||!dateParts||dateObj.getUTCFullYear()!==Number(dateParts[1])||dateObj.getUTCMonth()+1!==Number(dateParts[2])||dateObj.getUTCDate()!==Number(dateParts[3]))throw new Error('A valid journal date and journal lines are required.');
- const clean=lines.map(l=>{const rawDebit=Number(l.debit??0),rawCredit=Number(l.credit??0);if(!Number.isFinite(rawDebit)||!Number.isFinite(rawCredit))throw new Error('Journal amounts must be valid numbers.');return {account_id:Number(l.account_id||accountId(l.code)),description:l.description||description,debit:Math.round(rawDebit*100)/100,credit:Math.round(rawCredit*100)/100};}).filter(l=>l.debit>0||l.credit>0);
- if(clean.length<2||clean.some(l=>!l.account_id||l.debit<0||l.credit<0||((l.debit>0)===(l.credit>0))||!db.prepare('SELECT id FROM accounts WHERE id=? AND active=1').get(l.account_id)))throw new Error('Journal lines must each use an active account and contain either a positive debit or a positive credit.');
- const debit=Math.round(clean.reduce((n,l)=>n+l.debit,0)*100)/100,credit=Math.round(clean.reduce((n,l)=>n+l.credit,0)*100)/100;
- if(Math.abs(debit-credit)>0.005||debit<=0)throw new Error('Journal entry is not balanced. Total debits must equal total credits.');
- const entryNo='JE-'+Date.now().toString(36).toUpperCase()+'-'+crypto.randomBytes(2).toString('hex').toUpperCase();
- const ins=db.prepare('INSERT INTO journal_entries(entry_no,entry_date,description,source_type,source_id,created_by) VALUES(?,?,?,?,?,?)').run(entryNo,entryDate,description,sourceType,sourceId,userId);
- const lineIns=db.prepare('INSERT INTO journal_lines(entry_id,account_id,description,debit,credit) VALUES(?,?,?,?,?)');
- clean.forEach(l=>lineIns.run(ins.lastInsertRowid,l.account_id,l.description,l.debit,l.credit));
- return {id:ins.lastInsertRowid,entry_no:entryNo,total_debit:debit,total_credit:credit};
-}
-// Allocate a monetary total in cents without losing rounding cents.
-function allocateMoney(total, weights){
- const cents=Math.round(Number(total||0)*100),sum=weights.reduce((a,b)=>a+Math.max(0,Number(b)||0),0);
- if(!weights.length)return [];if(sum<=0)return weights.map((_,i)=>i===weights.length-1?cents/100:0);
- let used=0;return weights.map((w,i)=>{const c=i===weights.length-1?cents-used:Math.round(cents*Math.max(0,Number(w)||0)/sum);used+=c;return c/100;});
-}
-const r2=n=>Math.round(n*100)/100;
-const PAYMENT_METHODS=["Cash","Mobile Money","Bank Transfer","Card"];
-const validQty=v=>{const n=Number(v);return Number.isFinite(n)?Math.floor(n):0};
-// Cash that physically entered/left the drawer for one shift: cash tendered on sales, later cash receipts, and cash refunds.
-function shiftCash(shiftId){
- const sales=db.prepare("SELECT COALESCE(SUM(CASE WHEN tender_method IS NULL THEN (CASE WHEN payment_method='Cash' THEN total ELSE 0 END) WHEN tender_method='Cash' THEN MIN(initial_paid,total) ELSE 0 END),0) cash_sales,COUNT(*) transactions FROM sales WHERE shift_id=?").get(shiftId);
- const receipts=db.prepare("SELECT COALESCE(SUM(amount),0) n FROM customer_payments WHERE shift_id=? AND method='Cash'").get(shiftId).n;
- const refunds=db.prepare("SELECT COALESCE(SUM(r.total-r.receivable_offset),0) n FROM returns r LEFT JOIN sales s ON s.id=r.sale_id WHERE r.refund_method='Cash' AND COALESCE(r.shift_id,s.shift_id)=?").get(shiftId).n;
- return {cash_sales:r2(sales.cash_sales),cash_receipts:r2(receipts),cash_refunds:r2(refunds),transactions:sales.transactions};
-}
-function ledgerBalances(){const rows=db.prepare("SELECT a.code,ROUND(COALESCE(SUM(l.debit-l.credit),0),2) signed FROM accounts a LEFT JOIN journal_lines l ON l.account_id=a.id GROUP BY a.id").all();return code=>Number(rows.find(a=>a.code===code)?.signed||0);}
-// Safe schema upgrades for databases created by earlier SHOPFLOW versions.
-const ensureColumn=(table,col,ddl)=>{if(!db.prepare(`PRAGMA table_info(${table})`).all().some(c=>c.name===col))db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`)};
 // Barcode is separate from SKU so a printed barcode can be scanned without renaming internal codes.
 ensureColumn("products","barcode","TEXT");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode COLLATE NOCASE) WHERE barcode IS NOT NULL");
 db.exec("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)");
-const cleanBarcode=v=>{const b=String(v??"").trim();return b||null};
 const salesColumns=db.prepare("PRAGMA table_info(sales)").all().map(x=>x.name);
 if(!salesColumns.includes('shift_id')) db.exec('ALTER TABLE sales ADD COLUMN shift_id INTEGER REFERENCES shifts(id)');
 if(!salesColumns.includes('customer_id')) db.exec('ALTER TABLE sales ADD COLUMN customer_id INTEGER REFERENCES customers(id)');
@@ -156,16 +180,59 @@ if(!productCount&&process.env.SEED_DEMO_DATA==="true"){const ins=db.prepare("INS
  const seeded=db.prepare("SELECT id,name,stock,cost FROM products").all(),mvSeed=db.prepare("INSERT INTO inventory_movements(product_id,product_name,movement_type,quantity_change,stock_after,reference,note,created_by) VALUES(?,?,?,?,?,?,?,?)");
  seeded.forEach(p=>mvSeed.run(p.id,p.name,'opening_stock',p.stock,p.stock,'SEED','Demo opening stock','system'));
  const seedValue=r2(seeded.reduce((n,p)=>n+p.stock*p.cost,0));if(seedValue>0)postJournal({description:'Demo opening stock',sourceType:'opening_stock',sourceId:0,lines:[{code:'1200',debit:seedValue},{code:'3000',credit:seedValue}]});}
+}
 const usersCount=()=>db.prepare("SELECT COUNT(*) n FROM users").get().n;
-function currentUser(req,res,next){const token=req.cookies?.shopflow_session||req.headers["x-session-token"];if(!token)return res.status(401).json({error:"Please sign in."});const row=db.prepare("SELECT u.id,u.name,u.username,u.role,u.active,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?").get(hash(token));if(!row||!row.active||new Date(row.expires_at)<new Date()){if(token)db.prepare("DELETE FROM sessions WHERE token_hash=?").run(hash(token));return res.status(401).json({error:"Your session has expired. Sign in again."});}req.user=row;next();}
+// A session cookie looks like "<shop-code>.<token>", so every request knows which shop's database to use.
+const splitSession=raw=>{raw=String(raw||"");const i=raw.indexOf(".");return i>0?{slug:raw.slice(0,i),token:raw.slice(i+1)}:{slug:"",token:""}};
+const sessionRaw=req=>req.cookies?.shopflow_session||req.headers["x-session-token"]||"";
+function currentUser(req,res,next){const {token}=splitSession(sessionRaw(req));if(!token)return res.status(401).json({error:"Please sign in."});const row=db.prepare("SELECT u.id,u.name,u.username,u.role,u.active,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?").get(hash(token));if(!row||!row.active||new Date(row.expires_at)<new Date()){db.prepare("DELETE FROM sessions WHERE token_hash=?").run(hash(token));return res.status(401).json({error:"Your session has expired. Sign in again."});}req.user=row;next();}
 const roles=(...allowed)=>(req,res,next)=>allowed.includes(req.user.role)?next():res.status(403).json({error:"You do not have permission to perform this action."});
-app.use("/api", (req,res,next)=>{if(["/auth/status","/auth/setup","/auth/login"].includes(req.path))return next();currentUser(req,res,next);});
-app.get("/api/auth/status",(req,res)=>res.json({setupRequired:usersCount()===0}));
-app.post("/api/auth/setup",loginLimiter,(req,res)=>{if(usersCount())return res.status(403).json({error:"Initial setup has already been completed."});const {name,username,password}=req.body;if(!name||!username||!password||password.length<10)return res.status(400).json({error:"Provide name, username and a password of at least 10 characters."});const salt=crypto.randomBytes(16).toString("hex"),info=db.prepare("INSERT INTO users(name,username,password_hash,salt,role) VALUES(?,?,?,?,?)").run(name,username.toLowerCase(),scrypt(password,salt),salt,"admin");createSession(res,info.lastInsertRowid);res.status(201).json({ok:true});});
-function createSession(res,userId){const token=crypto.randomBytes(32).toString("hex"),expires=new Date(Date.now()+12*60*60*1000).toISOString();db.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)").run(hash(token),userId,expires);res.cookie("shopflow_session",token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:12*60*60*1000,path:"/"});}
-app.post("/api/auth/login",loginLimiter,(req,res)=>{const {username,password}=req.body;const u=db.prepare("SELECT * FROM users WHERE username=?").get(String(username||"").toLowerCase());if(!u||!u.active||scrypt(String(password||""),u.salt)!==u.password_hash)return res.status(401).json({error:"Incorrect username or password."});createSession(res,u.id);res.json({ok:true});});
+const SUSPENDED_MSG="This shop's account is suspended. Please contact support.";
+// Every /api request runs inside exactly one shop's database. The shop comes from the session cookie (or, for login, from the shop code that was typed).
+app.use("/api",(req,res,next)=>{
+ if(req.path==="/auth/signup"||req.path==="/auth/status")return next();
+ const isLogin=req.path==="/auth/login";
+ const slug=isLogin?String(req.body?.shop||"").trim().toLowerCase():splitSession(sessionRaw(req)).slug;
+ const shop=findShop(slug);
+ if(!shop)return res.status(401).json({error:isLogin?"Incorrect shop code, username or password.":"Please sign in."});
+ if(shop.status!=="active")return res.status(403).json({error:SUSPENDED_MSG});
+ let handle;try{handle=openShop(shop)}catch(e){console.error(e);return res.status(500).json({error:"This shop could not be opened. Please try again."})}
+ tenantStore.run(handle,()=>{if(isLogin)return next();currentUser(req,res,next)});
+});
+app.get("/api/auth/status",(req,res)=>{const shop=findShop(splitSession(sessionRaw(req)).slug);res.json({setupRequired:false,multiTenant:true,signedInShop:shop&&shop.status==="active"?{code:shop.slug,name:shop.name}:null})});
+const signupLimiter=rateLimit({windowMs:60*60*1000,limit:10,standardHeaders:true,legacyHeaders:false,message:{error:"Too many sign-ups from this connection. Try again later."}});
+const slugFromName=n=>String(n||"").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,30).replace(/-+$/,"");
+// Create a new shop: registers it, builds its database, creates its first administrator and starts a 14-day trial.
+app.post("/api/auth/signup",signupLimiter,(req,res)=>{
+ const b=req.body||{},shopName=String(b.shop_name||"").trim(),name=String(b.name||"").trim(),username=String(b.username||"").trim().toLowerCase(),password=String(b.password||"");
+ const slug=String(b.shop||slugFromName(shopName)).trim().toLowerCase();
+ if(shopName.length<2||shopName.length>80)return res.status(400).json({error:"Enter your shop name (2 to 80 characters)."});
+ if(!SLUG_RE.test(slug)||RESERVED_SLUGS.has(slug))return res.status(400).json({error:"The shop code must be 3 to 30 characters: lowercase letters, numbers and hyphens, starting with a letter or number."});
+ if(!name||!username||password.length<10)return res.status(400).json({error:"Provide your name, a username and a password of at least 10 characters."});
+ const file=`${slug}.db`,trialEnds=new Date(Date.now()+14*86400000).toISOString();
+ try{master.prepare("INSERT INTO shops(slug,name,db_file,trial_ends_at) VALUES(?,?,?,?)").run(slug,shopName,file,trialEnds)}
+ catch(e){if(/UNIQUE/.test(e.message))return res.status(409).json({error:"That shop code is already taken. Choose another."});throw e}
+ try{
+  const handle=openShop(findShop(slug));
+  tenantStore.run(handle,()=>{
+   const salt=crypto.randomBytes(16).toString("hex");
+   const info=db.prepare("INSERT INTO users(name,username,password_hash,salt,role) VALUES(?,?,?,?,?)").run(name,username,scrypt(password,salt),salt,"admin");
+   db.prepare("INSERT INTO settings(key,value) VALUES('business_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(shopName);
+   createSession(res,info.lastInsertRowid);
+  });
+  res.status(201).json({ok:true,shop:slug});
+ }catch(e){
+  // Roll back a half-created shop so the code can be used again.
+  console.error(e);const h=openShops.get(slug);if(h){openShops.delete(slug);try{h.db.close()}catch{}}
+  master.prepare("DELETE FROM shops WHERE slug=?").run(slug);
+  for(const ext of ["","-wal","-shm"])try{fs.rmSync(path.join(TENANT_DIR,file+ext),{force:true})}catch{}
+  res.status(500).json({error:"The shop could not be created. Please try again."});
+ }
+});
+function createSession(res,userId){const token=crypto.randomBytes(32).toString("hex"),expires=new Date(Date.now()+12*60*60*1000).toISOString(),slug=tenantStore.getStore().slug;db.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)").run(hash(token),userId,expires);res.cookie("shopflow_session",`${slug}.${token}`,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:12*60*60*1000,path:"/"});}
+app.post("/api/auth/login",loginLimiter,(req,res)=>{const {username,password}=req.body;const u=db.prepare("SELECT * FROM users WHERE username=?").get(String(username||"").toLowerCase());if(!u||!u.active||scrypt(String(password||""),u.salt)!==u.password_hash)return res.status(401).json({error:"Incorrect shop code, username or password."});createSession(res,u.id);res.json({ok:true});});
 app.get("/api/auth/me",(req,res)=>res.json({id:req.user.id,name:req.user.name,username:req.user.username,role:req.user.role}));
-app.post("/api/auth/logout",(req,res)=>{const token=req.cookies?.shopflow_session;if(token)db.prepare("DELETE FROM sessions WHERE token_hash=?").run(hash(token));res.clearCookie("shopflow_session",{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",path:"/"});res.json({ok:true});});
+app.post("/api/auth/logout",(req,res)=>{const {token}=splitSession(sessionRaw(req));if(token)db.prepare("DELETE FROM sessions WHERE token_hash=?").run(hash(token));res.clearCookie("shopflow_session",{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",path:"/"});res.json({ok:true});});
 app.get("/api/users",(req,res)=>{if(req.user.role!=="admin")return res.status(403).json({error:"Administrator access required."});res.json(db.prepare("SELECT id,name,username,role,active,created_at FROM users ORDER BY id").all());});
 app.post("/api/users",roles("admin"),(req,res)=>{const {name,username,password,role}=req.body;if(!name||!username||!password||password.length<10||!["admin","manager","cashier"].includes(role))return res.status(400).json({error:"Complete all fields. Password must be at least 10 characters."});const salt=crypto.randomBytes(16).toString("hex");try{const x=db.prepare("INSERT INTO users(name,username,password_hash,salt,role) VALUES(?,?,?,?,?)").run(name,username.toLowerCase(),scrypt(password,salt),salt,role);res.status(201).json({id:x.lastInsertRowid});}catch(e){res.status(400).json({error:"Username already exists."});}});
 app.patch("/api/users/:id",roles("admin"),(req,res)=>{
@@ -495,4 +562,15 @@ app.use((err,req,res,next)=>{
  const msg=err.type==="entity.parse.failed"?"Malformed JSON request.":status<500?err.message:/FOREIGN KEY/.test(err.message)?"This record is referenced by other records and cannot be changed this way.":/UNIQUE/.test(err.message)?"A record with that unique value already exists.":"The server could not complete the request.";
  res.status(status).json({error:msg});
 });
+// Upgrade path: a single-shop install (an existing shop.db with users) becomes the first shop, code "main", with its data untouched.
+(function importLegacyShop(){
+ try{
+  if(master.prepare("SELECT COUNT(*) n FROM shops").get().n||!fs.existsSync(DB_PATH))return;
+  const probe=new Database(DB_PATH,{readonly:true});let has=false,name="My Shop";
+  try{has=probe.prepare("SELECT COUNT(*) n FROM users").get().n>0;const r=probe.prepare("SELECT value FROM settings WHERE key='business_name'").get();if(r?.value)name=r.value}catch{}
+  probe.close();if(!has)return;
+  master.prepare("INSERT INTO shops(slug,name,db_file,plan) VALUES('main',?,?,'legacy')").run(name,path.resolve(DB_PATH));
+  console.log('Existing single-shop database registered as shop code "main".');
+ }catch(e){console.error("Legacy shop import skipped:",e.message)}
+})();
 app.listen(PORT,()=>console.log(`SHOPFLOW listening on ${PORT}`));

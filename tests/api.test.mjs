@@ -47,10 +47,10 @@ test.before(async () => { server = await start(); });
 test.after(() => { server?.kill(); rmSync(dir, { recursive: true, force: true }); });
 
 test("setup, staff and last-admin protection", async () => {
-  assert.ok([200, 201].includes((await admin.post("/auth/setup", { name: "Admin", username: "admin", password: "longpassword1" })).status));
+  assert.ok([200, 201].includes((await admin.post("/auth/signup", { shop_name: "Test Shop", shop: "testshop", name: "Admin", username: "admin", password: "longpassword1" })).status));
   const u = await admin.post("/users", { name: "Cash", username: "cash1", password: "longpassword1", role: "cashier" });
   assert.equal(u.status, 201); ids.cashierUser = u.json.id;
-  assert.equal((await cashier.post("/auth/login", { username: "cash1", password: "longpassword1" })).status, 200);
+  assert.equal((await cashier.post("/auth/login", { shop: "testshop", username: "cash1", password: "longpassword1" })).status, 200);
   const me = (await admin.get("/auth/me")).json;
   const demote = await admin.patch(`/users/${me.id}`, { role: "cashier" });
   assert.equal(demote.status, 400); assert.match(demote.json.error, /administrator/i);
@@ -194,7 +194,7 @@ test("demo data is journaled when SEED_DEMO_DATA=true", async () => {
   const port = PORT + 600, p = await start({ SEED_DEMO_DATA: "true" }, port, "seed.db");
   try {
     const c = new Client(`http://127.0.0.1:${port}/api`);
-    await c.post("/auth/setup", { name: "A", username: "a", password: "longpassword1" });
+    await c.post("/auth/signup", { shop_name: "Seed Shop", shop: "seedshop", name: "A", username: "a", password: "longpassword1" });
     assert.ok((await c.get("/products")).json.length > 0);
     const r = (await c.get("/accounting/reconciliation")).json;
     assert.ok(r.subledger_checks.every(x => x.ok), JSON.stringify(r.subledger_checks));
@@ -243,4 +243,72 @@ test("receipt settings: readable by all, writable by admin/manager, validated", 
   assert.equal((await admin.put("/settings", { business_phone: "024 000 0000" })).json.business_name, "Kofi Mart", "partial update leaves other fields alone");
   assert.equal((await admin.put("/settings", { business_name: "  " })).status, 400);
   assert.equal((await admin.put("/settings", { business_name: "x".repeat(81) })).status, 400);
+});
+
+test("multi-tenant: shops are isolated, codes are unique, logins are per shop", async () => {
+  const a = new Client(), b = new Client();
+  assert.equal((await a.post("/auth/signup", { shop_name: "Shop Alpha", shop: "alpha", name: "A", username: "boss", password: "longpassword1" })).status, 201);
+  assert.equal((await b.post("/auth/signup", { shop_name: "Shop Beta", shop: "beta", name: "B", username: "boss", password: "longpassword1" })).status, 201, "same username in another shop is fine");
+  const dup = await new Client().post("/auth/signup", { shop_name: "Another Alpha", shop: "alpha", name: "X", username: "x", password: "longpassword1" });
+  assert.equal(dup.status, 409);
+  assert.equal((await new Client().post("/auth/signup", { shop_name: "Bad", shop: "AB", name: "X", username: "x", password: "longpassword1" })).status, 400, "code too short");
+  assert.equal((await new Client().post("/auth/signup", { shop_name: "Bad", shop: "admin", name: "X", username: "x", password: "longpassword1" })).status, 400, "reserved code");
+  assert.equal((await new Client().post("/auth/signup", { shop_name: "Weak", shop: "weakshop", name: "X", username: "x", password: "short" })).status, 400, "weak password");
+  // Data written in Alpha is invisible in Beta and in the earlier test shop.
+  assert.equal((await a.post("/products", { name: "Alpha Only", sku: "AL-1", price: 5, cost: 2, stock: 0 })).status, 201);
+  assert.deepEqual((await b.get("/products")).json, [], "Beta sees nothing from Alpha");
+  assert.ok(!(await admin.get("/products")).json.some(p => p.name === "Alpha Only"), "the first shop sees nothing from Alpha");
+  assert.equal((await a.get("/settings")).json.business_name, "Shop Alpha");
+  assert.equal((await b.get("/settings")).json.business_name, "Shop Beta");
+  assert.equal((await a.get("/users")).json.length, 1, "staff lists are per shop");
+  // Logging in needs the right shop code.
+  assert.equal((await new Client().post("/auth/login", { shop: "alpha", username: "boss", password: "longpassword1" })).status, 200);
+  assert.equal((await new Client().post("/auth/login", { username: "boss", password: "longpassword1" })).status, 401, "no shop code");
+  assert.equal((await new Client().post("/auth/login", { shop: "nosuchshop", username: "boss", password: "longpassword1" })).status, 401);
+  assert.equal((await new Client().post("/auth/login", { shop: "beta", username: "boss", password: "wrongpassword1" })).status, 401);
+  // A session cannot be moved to another shop by changing the code in the cookie.
+  const token = a.cookie.split("=")[1].split(".")[1], forged = new Client(); forged.cookie = `shopflow_session=beta.${token}`;
+  assert.equal((await forged.get("/products")).status, 401, "token from Alpha is useless in Beta");
+  assert.equal((await new Client().get("/products")).status, 401, "no session, no data");
+  // Each shop has its own books that reconcile independently.
+  assert.equal((await a.get("/accounting/reconciliation")).json.balanced, true);
+  assert.equal((await b.get("/accounting/reconciliation")).json.balanced, true);
+});
+
+test("multi-tenant: a suspended shop is locked out and can be reactivated", async () => {
+  const { default: Database } = await import("better-sqlite3");
+  const g = new Client();
+  assert.equal((await g.post("/auth/signup", { shop_name: "Gamma", shop: "gamma", name: "G", username: "gboss", password: "longpassword1" })).status, 201);
+  assert.equal((await g.get("/products")).status, 200);
+  const m = new Database(path.join(dir, "master.db"));
+  try {
+    m.prepare("UPDATE shops SET status='suspended' WHERE slug='gamma'").run();
+    const blocked = await g.get("/products");
+    assert.equal(blocked.status, 403); assert.match(blocked.json.error, /suspended/i);
+    assert.equal((await new Client().post("/auth/login", { shop: "gamma", username: "gboss", password: "longpassword1" })).status, 403);
+    assert.equal((await admin.get("/products")).status, 200, "other shops are unaffected");
+    m.prepare("UPDATE shops SET status='active' WHERE slug='gamma'").run();
+    assert.equal((await g.get("/products")).status, 200, "reactivated shop works again");
+  } finally { m.close(); }
+});
+
+test("an existing single-shop database is adopted as shop 'main' with its data intact", async () => {
+  const { copyFileSync, existsSync } = await import("node:fs");
+  const d2 = mkdtempSync(path.join(tmpdir(), "shopflow-legacy-"));
+  const legacyPath = path.join(d2, "shop.db"), port = PORT + 700;
+  // Make a shop database with data in it, then use that file as if it were an old one-shop install.
+  const p1 = await start({ DATABASE_PATH: path.join(d2, "build", "x.db") }, port, "unused.db");
+  const c1 = new Client(`http://127.0.0.1:${port}/api`);
+  await c1.post("/auth/signup", { shop_name: "Old Shop", shop: "oldshop", name: "O", username: "owner", password: "longpassword1" });
+  await c1.post("/products", { name: "Legacy Item", sku: "LG-1", price: 3, cost: 1, stock: 0 });
+  p1.kill(); await new Promise(r => setTimeout(r, 300));
+  const built = path.join(d2, "build", "shops", "oldshop.db");
+  for (const ext of ["", "-wal", "-shm"]) if (existsSync(built + ext)) copyFileSync(built + ext, legacyPath + ext);
+  const p2 = await start({ DATABASE_PATH: legacyPath }, port + 1, "unused.db");
+  try {
+    const c2 = new Client(`http://127.0.0.1:${port + 1}/api`);
+    assert.equal((await c2.post("/auth/login", { shop: "main", username: "owner", password: "longpassword1" })).status, 200);
+    assert.ok((await c2.get("/products")).json.some(p => p.name === "Legacy Item"), "legacy data is intact");
+    assert.equal((await c2.get("/settings")).json.business_name, "Old Shop");
+  } finally { p2.kill(); rmSync(d2, { recursive: true, force: true }); }
 });

@@ -42,6 +42,17 @@ A responsive shop management system using:
 - SQLite database; `DATABASE_PATH` environment variable supports persistent disk mounting
 - Responsive desktop, tablet and mobile interface
 
+## Multi-tenant SaaS (many shops, one app)
+
+ShopFlow now serves many shops from one deployment. Each shop gets **its own database file** (`<data folder>/shops/<shop-code>.db`), and a small `master.db` lists the shops. A request can only ever reach the database of the shop it signed in to, so one shop cannot see another's data.
+
+- **Create a shop:** on the login screen choose **Create a shop**. Enter the shop name, your name, a username and a password (10+ characters). The shop code is made from the shop name unless you type one (3 to 30 characters: lowercase letters, numbers, hyphens). The shop starts a 14-day trial and you become its administrator.
+- **Sign in:** shop code + username + password. The same username can exist in different shops.
+- **Existing single-shop installs:** if `DATABASE_PATH` already holds a shop with users, it is registered automatically as shop code `main` the first time the new version starts. Nothing is lost.
+- **Suspend or reactivate a shop** (until the super-admin screen exists): set `status` to `suspended` or `active` in the `shops` table of `master.db`. A suspended shop is locked out immediately.
+- **Where data lives on Render:** with `DATABASE_PATH=/var/data/shop.db`, the master database and the `shops` folder are created inside `/var/data`, which is on the persistent disk. Back up that whole folder. Set `DATA_DIR` to put them somewhere else.
+- **Not built yet:** the trial end date is recorded but not enforced, and there is no payment or plan billing and no super-admin screen.
+
 ## Barcode scanner and receipt printer
 
 **Scanner.** Any USB or Bluetooth scanner that behaves like a keyboard ("HID keyboard" mode) works. It must send **Enter** after each scan, which is the factory default on most models.
@@ -73,14 +84,16 @@ npm start
 Open http://localhost:3000. On first launch, create the first administrator account. Use a unique password of at least 10 characters.
 
 ## Render deployment
-1. Push the project to GitHub.
-2. Create a Render Web Service connected to the repository.
-3. Build command: `npm install`
-4. Start command: `npm start`
-5. Add a persistent disk mounted at `/var/data`.
-6. Set environment variable `DATABASE_PATH=/var/data/shop.db`.
-7. Set `NODE_ENV=production`.
-8. Deploy, then open the service and complete first-run administrator setup.
+Easiest: use the Blueprint in `render.yaml`.
+1. Push the project to a **private** GitHub repository (the `.gitignore` already keeps databases and `.env` out).
+2. In Render choose **New > Blueprint**, pick the repository, and approve. It creates the web service (`plan: starter`, a paid plan, required for a persistent disk), a 1 GB disk mounted at `/var/data`, and the settings `NODE_ENV=production`, `DATABASE_PATH=/var/data/shop.db` and `NODE_VERSION=20`.
+3. Wait for the deploy to show **Live**, then open the `https://<name>.onrender.com` address. The health check is `/api/auth/status`.
+4. Click **Create a shop** to make your first shop (you are its administrator). Send other shops to the same address to create their own.
+5. If you want your own domain, add it under the service's **Settings > Custom Domains**.
+
+Manual setup (instead of the Blueprint): Web Service, build `npm install`, start `npm start`, a disk mounted at `/var/data`, and the environment variables above.
+
+Run **one instance only**. The databases are SQLite files on a single disk, so do not scale to several instances.
 
 ## Important production notes
 This is a development milestone, not a certified production POS. Before handling live commercial transactions:

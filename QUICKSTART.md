@@ -19,7 +19,7 @@ npm test
 ```
 
 ## Deploy on Render
-Push to GitHub, then New > Blueprint (uses `render.yaml`: persistent disk at /var/data, NODE_ENV=production).
+Push to GitHub, then New > Blueprint (uses `render.yaml`: persistent disk at /var/data, NODE_ENV=production, Node 20). Then open the site and use Create a shop.
 Persistent disks need a paid Render plan.
 
 Dependencies are not bundled: `better-sqlite3` is a native module, so `npm install` must run on the machine that runs the app.

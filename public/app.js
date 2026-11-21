@@ -29,7 +29,7 @@ function beep(ok=true){try{audioCtx=audioCtx||new(window.AudioContext||window.we
 // Scanners type the code and press Enter. An exact barcode/SKU match (case-insensitive) goes straight to the cart; a single search hit works too.
 function scanCode(code){
  code=String(code||"").trim();if(!code)return false;
- const q=esc(code).toLowerCase();
+ const q=code.toLowerCase();
  let hit=products.find(p=>p.barcode&&String(p.barcode).toLowerCase()===q)||products.find(p=>String(p.sku||"").toLowerCase()===q);
  if(!hit){const list=posFiltered();if(list.length===1)hit=list[0]}
  if(!hit){beep(false);toast(`No product found for "${code}".`);return false}
@@ -52,7 +52,7 @@ function loadScript(src){return new Promise((ok,fail)=>{const t=document.createE
 async function zxingDetector(){
  if(!window.ZXing)await loadScript(ZXING_URL);
  const Z=window.ZXing;if(!Z)throw new Error("ZXing missing");
- const hints=new Map();hints.set(Z.DecodeHintType.TRY_HARDER,true);
+ const hints=new Map();hints.set(Z.DecodeHintType.TRY_HARDER,true);const BF=Z.BarcodeFormat;hints.set(Z.DecodeHintType.POSSIBLE_FORMATS,[BF.QR_CODE,BF.EAN_13,BF.EAN_8,BF.UPC_A,BF.UPC_E,BF.CODE_128,BF.CODE_39,BF.CODE_93,BF.ITF,BF.CODABAR,BF.DATA_MATRIX,BF.PDF_417,BF.AZTEC]);
  const reader=new Z.MultiFormatReader();reader.setHints(hints);
  const canvas=document.createElement("canvas"),ctx=canvas.getContext("2d",{willReadFrequently:true});
  return{async detect(video){
@@ -62,28 +62,68 @@ async function zxingDetector(){
   catch{return[]} // nothing readable in this frame
  }};
 }
-async function openCameraScanner(){
- if(!navigator.mediaDevices?.getUserMedia)return toast("This browser can't use the camera. Use a handheld scanner instead.");
- if(!window.isSecureContext)return toast("Camera scanning needs a secure (https) connection.");
- // Chrome/Edge/Android have a built-in reader. iPhone Safari and Firefox do not, so they load the ZXing reader instead (needs internet once).
- let det;
- if("BarcodeDetector" in window){try{det=new BarcodeDetector()}catch{}}
- if(!det){toast("Loading the scanner…");try{det=await zxingDetector()}catch{return toast("Couldn't load the camera scanner. Check your internet connection, or use a handheld scanner.")}}
- modal("Scan with camera","Point the camera at a barcode or QR code. Each read adds the item to the order.",`<video id="camVideo" playsinline webkit-playsinline muted autoplay style="width:100%;max-height:50vh;border-radius:12px;background:#000"></video><p class="muted" id="camStatus">Starting camera…</p>`,"Done",()=>{stopCamera();closeModal()});
- const cancel=$("#modal .btn.light");if(cancel)cancel.onclick=()=>{stopCamera();closeModal()};
- try{camStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"}},audio:false})}
- catch{closeModal();return toast("Camera access was blocked. Allow the camera for this site and try again.")}
- const v=$("#camVideo");if(!v){stopCamera();return}
- v.srcObject=camStream;await v.play().catch(()=>{});
- $("#camStatus").textContent="Scanning…";
- let last="",lastAt=0,busy=false;
+// The built-in BarcodeDetector often exists but doesn't work (Windows/Linux Chrome, some Android builds), so we test it and fall back to ZXing.
+async function nativeDetector(){
+ if(!("BarcodeDetector" in window))return null;
+ try{
+  const want=["qr_code","ean_13","ean_8","upc_a","upc_e","code_128","code_39","code_93","itf","codabar","data_matrix","pdf417","aztec"];
+  const have=BarcodeDetector.getSupportedFormats?await BarcodeDetector.getSupportedFormats():want;
+  const formats=want.filter(f=>have.includes(f));
+  if(!formats.length)return null;
+  const d=new BarcodeDetector({formats});
+  const c=document.createElement("canvas");c.width=c.height=32;
+  await d.detect(c); // throws if the platform has no barcode service
+  return d;
+ }catch{return null}
+}
+// Starts the camera in a <video> element and calls onCode(code) for every read. Returns true when scanning started.
+async function startCamScan(v,statusEl,onCode){
+ const say=t=>{if(statusEl)statusEl.textContent=t};
+ if(!navigator.mediaDevices?.getUserMedia){toast("This browser can't use the camera. Use a handheld scanner instead.");return false}
+ if(!window.isSecureContext){toast("Camera scanning needs a secure (https) connection.");return false}
+ stopCamera();
+ say("Starting camera…");
+ let det=await nativeDetector(),usingZx=false;
+ const loadZx=async()=>{say("Loading the scanner…");det=await zxingDetector();usingZx=true};
+ if(!det){try{await loadZx()}catch{toast("Couldn't load the camera scanner. Check your internet connection, or use a handheld scanner.");return false}}
+ const tries=[{video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}},audio:false},{video:{facingMode:{ideal:"environment"}},audio:false},{video:true,audio:false}];
+ let err;
+ for(const c of tries){try{camStream=await navigator.mediaDevices.getUserMedia(c);err=null;break}catch(e){err=e;if(e&&(e.name==="NotAllowedError"||e.name==="SecurityError"))break}}
+ if(err||!camStream){const n=err&&err.name;toast(n==="NotAllowedError"?"Camera access was blocked. Allow the camera for this site and try again.":n==="NotFoundError"?"No camera was found on this device.":n==="NotReadableError"?"The camera is being used by another app. Close it and try again.":"Couldn't start the camera.");return false}
+ v.muted=true;v.setAttribute("muted","");v.srcObject=camStream;
+ try{await v.play()}catch{}
+ try{const t=camStream.getVideoTracks()[0],caps=t.getCapabilities?.()||{};if(caps.focusMode?.includes("continuous"))await t.applyConstraints({advanced:[{focusMode:"continuous"}]})}catch{}
+ say("Scanning…");
+ let last="",lastAt=0,busy=false,fails=0;
+ clearInterval(camTimer);
  camTimer=setInterval(async()=>{
-  if(busy||v.readyState<2)return;busy=true;
-  try{const r=await det.detect(v);if(r.length){const c=r[0].rawValue,now=Date.now();
-   // Ignore the same code seen again within 2 seconds so one scan = one item.
-   if(c&&(c!==last||now-lastAt>2000)){last=c;lastAt=now;const ok=scanCode(c);const st=$("#camStatus");if(st)st.textContent=ok?`Added: ${c}`:`Not added: ${c}`}}}catch{}
+  if(busy||v.readyState<2||!camStream)return;busy=true;
+  try{
+   const r=await det.detect(v);fails=0;
+   if(r.length){const c=r[0].rawValue,now=Date.now();
+    // Ignore the same code seen again within 2 seconds so one scan = one read.
+    if(c&&(c!==last||now-lastAt>2000)){last=c;lastAt=now;onCode(c,say)}}
+  }catch{
+   if(!usingZx&&++fails>=3){try{await loadZx();fails=0;say("Scanning…")}catch{say("Scanner unavailable. Check your internet connection.")}}
+  }
   busy=false;
  },250);
+ return true;
+}
+// POS: scan items straight into the order.
+async function openCameraScanner(){
+ modal("Scan with camera","Point the camera at a barcode or QR code. Each read adds the item to the order.",`<video id="camVideo" playsinline webkit-playsinline muted autoplay style="width:100%;max-height:50vh;border-radius:12px;background:#000"></video><p class="muted" id="camStatus">Starting camera…</p>`,"Done",closeModal);
+ const cancel=$("#modal .btn.light");if(cancel)cancel.onclick=closeModal;
+ const ok=await startCamScan($("#camVideo"),$("#camStatus"),(c,say)=>{say(scanCode(c)?`Added: ${c}`:`Not added: ${c}`)});
+ if(!ok)closeModal();
+}
+// Add/Edit product: fill the Barcode field from the camera without leaving the form.
+async function scanIntoBarcode(){
+ const box=$("#fBarcodeCam"),input=$("#fBarcode");if(!box||!input)return;
+ if(box.style.display==="block"){stopCamera();box.style.display="none";return}
+ box.style.display="block";
+ const ok=await startCamScan($("#fBarcodeVideo"),$("#fBarcodeStatus"),(c)=>{input.value=c;beep(true);stopCamera();box.style.display="none";toast(`Barcode captured: ${c}`);input.focus()});
+ if(!ok)box.style.display="none";
 }
 // If the cashier clicked elsewhere, the first scanned character moves focus back to the search box.
 document.addEventListener("keydown",e=>{
@@ -104,7 +144,7 @@ async function pos(reload=true){
 function addCart(id){const p=products.find(x=>x.id===id);if(!p||p.stock<1){toast("This product is out of stock.");return false}let x=cart.find(x=>x.id===id);if(x){if(x.quantity>=p.stock){toast("Not enough stock available.");return false}x.quantity++}else cart.push({id:p.id,name:p.name,price:p.price,quantity:1});pos(false);return true}
 function changeQty(id,delta){let x=cart.find(x=>x.id===id),p=products.find(p=>p.id===id);if(!x)return;x.quantity+=delta;if(x.quantity<1)cart=cart.filter(a=>a.id!==id);else if(x.quantity>p.stock){x.quantity=p.stock;toast("Available stock limit reached.")}pos(false)}
 function modal(title,desc,body,submitText,fn){$("#modal").innerHTML=`<h2>${title}</h2><p>${desc}</p>${body}<div class="modal-actions"><button class="btn light" onclick="closeModal()">Cancel</button><button class="btn" id="modalSubmit">${submitText}</button></div>`;$("#modalBackdrop").classList.add("show");$("#modalSubmit").onclick=fn}
-function closeModal(){$("#modalBackdrop").classList.remove("show")}
+function closeModal(){if(typeof stopCamera==="function")stopCamera();$("#modalBackdrop").classList.remove("show")}
 async function checkout(){
  const subtotal=cart.reduce((s,x)=>s+x.price*x.quantity,0),customers=await api("/customers");
  modal("Complete payment","Record full payment, part payment or customer credit.",`<div class="panel inset"><div class="total-line"><span>Order total</span><b>${money(subtotal)}</b></div></div>
@@ -160,7 +200,7 @@ function printReceipt(s,items=[]){
  f.srcdoc=html;document.body.appendChild(f);
 }
 async function productPage(){await loadProducts();$("#content").innerHTML=heading("Products & Stock","Manage your catalogue, pricing and stock levels.",`<button class="btn" onclick="productModal()">＋ Add product</button>`)+`<div class="panel"><div class="toolbar"><input class="search" placeholder="Search product, SKU, barcode or category..." oninput="filterTable(this.value,'productsTable')"><span class="spacer"></span><span class="subtle-link">${products.length} product records</span></div><div class="table-wrap"><table id="productsTable"><thead><tr><th>Product</th><th>SKU</th><th>Barcode</th><th>Category</th><th>Selling price</th><th>Cost price</th><th>Stock</th><th>Status</th><th>Action</th></tr></thead><tbody>${products.map(p=>`<tr><td><strong>${p.name}</strong></td><td>${p.sku}</td><td>${p.barcode||"—"}</td><td>${p.category}</td><td>${money(p.price)}</td><td>${money(p.cost)}</td><td>${p.stock}</td><td><span class="status ${p.stock===0?'out':p.stock<=p.reorder_level?'low':''}">${p.stock===0?'Out of stock':p.stock<=p.reorder_level?'Low stock':'In stock'}</span></td><td><button class="btn light" onclick="productModal(${p.id})">Edit</button></td></tr>`).join("")}</tbody></table></div></div>`}
-function productModal(id){const p=products.find(x=>x.id===id)||{sku:"",barcode:"",name:"",category:"General",price:0,cost:0,stock:0,reorder_level:5};modal(id?"Edit product":"Add a product","Keep product details and stock quantities up to date.",`<div class="form-grid"><div class="field"><label>Product name *</label><input id="fName" value="${p.name}"></div><div class="field"><label>SKU (your internal code)</label><input id="fSku" value="${p.sku}"></div><div class="field"><label>Barcode (click here, then scan)</label><input id="fBarcode" autocomplete="off" value="${p.barcode||""}"></div><div class="field"><label>Category</label><input id="fCategory" value="${p.category}"></div><div class="field"><label>Selling price (GH₵) *</label><input id="fPrice" type="number" min="0" step=".01" value="${p.price}"></div><div class="field"><label>Cost price (GH₵)</label><input id="fCost" type="number" min="0" step=".01" value="${p.cost}" ${id?'readonly title="Cost comes from purchases"':''}></div><div class="field"><label>Stock quantity</label><input id="fStock" type="number" min="0" value="${p.stock}" ${id?'readonly title="Change stock via Inventory Control"':''}></div><div class="field"><label>Reorder level</label><input id="fReorder" type="number" min="0" value="${p.reorder_level}"></div></div>`,"Save product",async()=>{const body={name:$("#fName").value,sku:$("#fSku").value,barcode:$("#fBarcode").value,category:$("#fCategory").value,price:+$("#fPrice").value,cost:+$("#fCost").value,stock:+$("#fStock").value,reorder_level:+$("#fReorder").value};try{await api(id?`/products/${id}`:"/products",{method:id?"PUT":"POST",body:JSON.stringify(body)});closeModal();toast("Product saved.");productPage()}catch(e){toast(e.message)}})}
+function productModal(id){const p=products.find(x=>x.id===id)||{sku:"",barcode:"",name:"",category:"General",price:0,cost:0,stock:0,reorder_level:5};modal(id?"Edit product":"Add a product","Keep product details and stock quantities up to date.",`<div class="form-grid"><div class="field"><label>Product name *</label><input id="fName" value="${p.name}"></div><div class="field"><label>SKU (your internal code)</label><input id="fSku" value="${p.sku}"></div><div class="field"><label>Barcode (type, use a handheld scanner, or use the camera)</label><div style="display:flex;gap:8px"><input id="fBarcode" autocomplete="off" autocapitalize="off" spellcheck="false" style="flex:1" onkeydown="if(event.key==='Enter'){event.preventDefault()}" value="${esc(p.barcode||"")}"><button type="button" class="btn outline" onclick="scanIntoBarcode()">📷 Scan</button></div><div id="fBarcodeCam" style="display:none;margin-top:8px"><video id="fBarcodeVideo" playsinline webkit-playsinline muted autoplay style="width:100%;max-height:40vh;border-radius:12px;background:#000"></video><p class="muted" id="fBarcodeStatus">Starting camera…</p></div></div><div class="field"><label>Category</label><input id="fCategory" value="${p.category}"></div><div class="field"><label>Selling price (GH₵) *</label><input id="fPrice" type="number" min="0" step=".01" value="${p.price}"></div><div class="field"><label>Cost price (GH₵)</label><input id="fCost" type="number" min="0" step=".01" value="${p.cost}" ${id?'readonly title="Cost comes from purchases"':''}></div><div class="field"><label>Stock quantity</label><input id="fStock" type="number" min="0" value="${p.stock}" ${id?'readonly title="Change stock via Inventory Control"':''}></div><div class="field"><label>Reorder level</label><input id="fReorder" type="number" min="0" value="${p.reorder_level}"></div></div>`,"Save product",async()=>{const body={name:$("#fName").value,sku:$("#fSku").value,barcode:$("#fBarcode").value,category:$("#fCategory").value,price:+$("#fPrice").value,cost:+$("#fCost").value,stock:+$("#fStock").value,reorder_level:+$("#fReorder").value};try{await api(id?`/products/${id}`:"/products",{method:id?"PUT":"POST",body:JSON.stringify(body)});closeModal();toast("Product saved.");productPage()}catch(e){toast(e.message)}})}
 function filterTable(v,id){document.querySelectorAll(`#${id} tbody tr`).forEach(r=>r.style.display=r.innerText.toLowerCase().includes(v.toLowerCase())?"":"none")}
 async function salesPage(){const sales=await api("/sales");$("#content").innerHTML=heading("Sales history","Review completed transactions and payment records.")+`<div class="panel"><div class="toolbar"><input class="search" placeholder="Search receipt or payment..." oninput="filterTable(this.value,'salesTable')"><span class="spacer"></span><button class="btn outline" onclick="setPage('pos')">＋ New sale</button></div><div class="table-wrap"><table id="salesTable"><thead><tr><th>Receipt</th><th>Date & time</th><th>Cashier</th><th>Payment</th><th>Amount</th><th>Action</th></tr></thead><tbody>${sales.map(s=>`<tr><td><strong>${s.receipt_no}</strong></td><td>${new Date(s.created_at+"Z").toLocaleString()}</td><td>${s.cashier}</td><td>${s.payment_method}</td><td><strong>${money(s.total)}</strong></td><td><button class="btn light" onclick="viewSale(${s.id})">Details</button></td></tr>`).join("")||`<tr><td colspan="6" class="empty">No transactions recorded yet.</td></tr>`}</tbody></table></div></div>`}
 async function viewSale(id){const [s,items]=await Promise.all([api("/sales"),api(`/sales/${id}/items`)]);const sale=s.find(x=>x.id===id);modal(sale.receipt_no,"Transaction details",`<div class="receipt">${items.map(x=>`<div class="receipt-line"><span>${x.product_name} × ${x.quantity}</span><b>${money(x.line_total)}</b></div>`).join("")}<hr><div class="receipt-line"><b>Total</b><b>${money(sale.total)}</b></div><div class="receipt-line"><span>Paid</span><span>${money(sale.amount_paid)}</span></div><div class="receipt-line"><span>Change</span><span>${money(sale.change_due)}</span></div></div>`,"Print receipt",()=>printReceipt(sale,items))}
@@ -241,10 +281,27 @@ $("#today").textContent=new Date().toLocaleDateString("en-GH",{weekday:"short",d
 let currentUser=null,authMode="login";
 const originalApi=api;
 api=async(url,opts={})=>{try{return await originalApi(url,opts)}catch(e){if(e.message==="Please sign in."||e.message.includes("session has expired"))showAuth(false);throw e}};
-async function initializeAuth(){try{const s=await originalApi("/auth/status");if(s.setupRequired){showAuth(true)}else{currentUser=await originalApi("/auth/me");showWorkspace();}}catch(e){showAuth(false)}}
-function showAuth(setup){authMode=setup?"setup":"login";$("#authScreen").classList.add("show");$("#nameField").hidden=!setup;$("#authTitle").textContent=setup?"Set up your shop administrator":"Welcome back";$("#authDesc").textContent=setup?"Create the first administrator account. Use a strong password.":"Sign in to access your shop workspace.";$("#authSubmit").textContent=setup?"Create administrator":"Sign in";$("#authHint").textContent=setup?"The first account will have full administrator access.":"Your shop data is protected by your account."}
+async function initializeAuth(){try{const s=await originalApi("/auth/status");const saved=localStorage.getItem("shopflow_shop")||"";if(s.signedInShop){try{currentUser=await originalApi("/auth/me");showWorkspace();return}catch{}}showAuth(false,s.signedInShop?.code||saved)}catch(e){showAuth(false)}}
+function showAuth(signup,shopCode){
+ authMode=signup?"signup":"login";
+ const set=(id,v)=>{const el=$(id);if(el)el.hidden=v};
+ $("#authScreen").classList.add("show");
+ set("#shopNameField",!signup);set("#nameField",!signup);
+ $("#authTitle").textContent=signup?"Create your shop":"Welcome back";
+ $("#authDesc").textContent=signup?"Start a free 14-day trial. You will be the shop's administrator.":"Sign in with your shop code, username and password.";
+ $("#authSubmit").textContent=signup?"Create my shop":"Sign in";
+ $("#authHint").textContent=signup?"Your shop code is how you and your staff sign in.":"Your shop data is private to your shop.";
+ $("#authSwitch").innerHTML=signup?'Already have a shop? <a href="#" onclick="showAuth(false);return false">Sign in</a>':'New here? <a href="#" onclick="showAuth(true);return false">Create a shop</a>';
+ if(signup)$("#authShop").value="";else{let saved="";try{saved=localStorage.getItem("shopflow_shop")||""}catch{}const code=typeof shopCode==="string"&&shopCode?shopCode:saved;if(code)$("#authShop").value=code}
+ $("#authShop").required=!signup;$("#authShop").placeholder=signup?"Optional. Made from your shop name":"e.g. kofi-pharmacy";
+}
 function showWorkspace(){$("#authScreen").classList.remove("show");$("#sidebar .user-mini b").textContent=currentUser.name;$("#sidebar .user-mini small").textContent=currentUser.role;["finance","reports","inventory","purchases","returns"].forEach(p=>{const n=document.querySelector(`[data-page="${p}"]`);if(n)n.hidden=currentUser.role==="cashier"});const supplierPayNote=document.querySelector(`[data-page="credit"]`);if(supplierPayNote)supplierPayNote.hidden=false;loadSettings();setPage("dashboard");}
-$("#authForm").addEventListener("submit",async e=>{e.preventDefault();const body={username:$("#authUser").value.trim(),password:$("#authPass").value};if(authMode==="setup")body.name=$("#authName").value.trim();try{await originalApi(authMode==="setup"?"/auth/setup":"/auth/login",{method:"POST",body:JSON.stringify(body)});currentUser=await originalApi("/auth/me");$("#authPass").value="";showWorkspace()}catch(err){toast(err.message)}});
+$("#authForm").addEventListener("submit",async e=>{e.preventDefault();
+ const body={shop:$("#authShop").value.trim().toLowerCase(),username:$("#authUser").value.trim(),password:$("#authPass").value};
+ if(authMode==="signup"){body.shop_name=$("#authShopName").value.trim();body.name=$("#authName").value.trim();if(!body.shop)delete body.shop}
+ try{const r=await originalApi(authMode==="signup"?"/auth/signup":"/auth/login",{method:"POST",body:JSON.stringify(body)});
+  try{localStorage.setItem("shopflow_shop",authMode==="signup"?(r.shop||body.shop):body.shop)}catch{}
+  currentUser=await originalApi("/auth/me");$("#authPass").value="";showWorkspace()}catch(err){toast(err.message)}});
 const oldSetPage=setPage;
 setPage=function(p){if(p==="staff"&&currentUser?.role!=="admin"){toast("Administrator access required.");return}oldSetPage(p)};
 async function simplePageV2(p){

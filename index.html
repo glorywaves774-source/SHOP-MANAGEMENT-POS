@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#efeaff"><title>ShopFlow — Shop Management</title><script src="/theme.js"></script><link rel="stylesheet" href="/styles.css"></head>
+<body><div class="app-shell">
+<aside class="sidebar" id="sidebar"><div class="brand"><div class="brand-mark">S</div><div><b>SHOPFLOW</b><small>MANAGEMENT SUITE</small></div><button class="close-nav" id="closeNav">×</button></div>
+<div class="nav-label">WORKSPACE</div><nav id="nav">
+<button class="nav-item active" data-page="dashboard"><span>▦</span> Dashboard</button>
+<button class="nav-item" data-page="pos"><span>▣</span> Point of Sale <i class="nav-dot"></i></button>
+<div class="nav-label">MANAGEMENT</div>
+<button class="nav-item" data-page="products"><span>▤</span> Products & Stock</button>
+<button class="nav-item" data-page="inventory"><span>⇅</span> Inventory Control</button>
+<button class="nav-item" data-page="shifts"><span>◷</span> Cashier Shifts</button>
+<button class="nav-item" data-page="sales"><span>↗</span> Sales</button>
+<button class="nav-item" data-page="purchases"><span>⇩</span> Purchases</button>
+<button class="nav-item" data-page="customers"><span>♙</span> Customers</button>
+<button class="nav-item" data-page="suppliers"><span>♧</span> Suppliers</button>
+<button class="nav-item" data-page="credit"><span>₵</span> Credit & Balances</button>
+<button class="nav-item" data-page="expenses"><span>↘</span> Expenses</button>
+<button class="nav-item" data-page="returns"><span>↩</span> Returns & Refunds</button>
+<div class="nav-label">INSIGHTS & ADMIN</div>
+<button class="nav-item" data-page="reports"><span>▥</span> Reports</button>
+<button class="nav-item" data-page="finance"><span>▧</span> Financial Statements</button>
+<button class="nav-item" data-page="staff"><span>♙</span> Staff & Access</button>
+<button class="nav-item" data-page="settings"><span>⚙</span> Settings</button>
+</nav><div class="sidebar-bottom"><div class="help-card"><div class="help-icon">✦</div><b>Need a hand?</b><p>Make your shop run smoothly.</p><a href="mailto:info@kayronglobaltech.com">Get support ↗</a></div><div class="user-mini"><div class="avatar">AD</div><div><b>Shop Admin</b><small>Administrator</small></div><span class="more">•••</span></div></div></aside>
+<main class="main"><header class="topbar"><button class="menu-toggle" id="menuToggle">☰</button><div class="breadcrumb">Workspace <span>/</span> <b id="crumb">Dashboard</b></div><div class="top-actions"><div class="date-pill" id="today"></div><button class="icon-btn theme-btn" data-theme-toggle data-label-dark="Switch to dark mode" data-label-light="Switch to light mode" aria-label="Switch theme"><span class="tt-icon">☾</span></button><button class="icon-btn" title="Notifications">♧<i></i></button><div class="top-avatar">AD</div></div></header>
+<section class="content" id="content"></section></main></div>
+<div class="auth-screen" id="authScreen"><div class="auth-card"><div class="brand-mark">S</div><div class="eyebrow">SHOPFLOW MANAGEMENT SUITE</div><h1 id="authTitle">Welcome back</h1><p id="authDesc">Sign in to manage your shop.</p><form id="authForm"><div class="field" id="shopNameField" hidden><label>Shop name</label><input id="authShopName" autocomplete="organization" maxlength="80"></div><div class="field"><label>Shop code</label><input id="authShop" autocapitalize="off" spellcheck="false" maxlength="30" placeholder="e.g. kofi-pharmacy" required></div><div class="field" id="nameField" hidden><label>Full name</label><input id="authName" autocomplete="name"></div><div class="field"><label>Username</label><input id="authUser" autocomplete="username" required></div><div class="field"><label>Password</label><input id="authPass" type="password" autocomplete="current-password" required></div><button class="btn" id="authSubmit" type="submit" style="width:100%;justify-content:center">Sign in</button></form><p id="authSwitch" class="muted" style="margin:14px 0 6px"></p><small id="authHint">Your shop data is protected by your account.</small></div></div><div class="toast" id="toast"></div><div class="modal-backdrop" id="modalBackdrop"><div class="modal" id="modal"></div></div><script src="/app.js?v=1795301624"></script><script src="/motion.js?v=1795301624"></script></body></html>
