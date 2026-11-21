@@ -78,7 +78,8 @@ async function nativeDetector(){
 }
 // Starts the camera in a <video> element and calls onCode(code) for every read. Returns true when scanning started.
 async function startCamScan(v,statusEl,onCode){
- const say=t=>{if(statusEl)statusEl.textContent=t};
+ if(!v){toast("Scanner view not ready. Please try again.");return false}
+ const say=t=>{if(statusEl&&statusEl.isConnected)statusEl.textContent=t};
  if(!navigator.mediaDevices?.getUserMedia){toast("This browser can't use the camera. Use a handheld scanner instead.");return false}
  if(!window.isSecureContext){toast("Camera scanning needs a secure (https) connection.");return false}
  stopCamera();
@@ -100,7 +101,8 @@ async function startCamScan(v,statusEl,onCode){
   if(busy||v.readyState<2||!camStream)return;busy=true;
   try{
    const r=await det.detect(v);fails=0;
-   if(r.length){const c=r[0].rawValue,now=Date.now();
+   if(!camStream)return; // camera was closed while this frame was being read
+   if(r&&r.length){const c=r[0].rawValue,now=Date.now();
     // Ignore the same code seen again within 2 seconds so one scan = one read.
     if(c&&(c!==last||now-lastAt>2000)){last=c;lastAt=now;onCode(c,say)}}
   }catch{
@@ -112,18 +114,22 @@ async function startCamScan(v,statusEl,onCode){
 }
 // POS: scan items straight into the order.
 async function openCameraScanner(){
+ try{
  modal("Scan with camera","Point the camera at a barcode or QR code. Each read adds the item to the order.",`<video id="camVideo" playsinline webkit-playsinline muted autoplay style="width:100%;max-height:50vh;border-radius:12px;background:#000"></video><p class="muted" id="camStatus">Starting camera…</p>`,"Done",closeModal);
  const cancel=$("#modal .btn.light");if(cancel)cancel.onclick=closeModal;
  const ok=await startCamScan($("#camVideo"),$("#camStatus"),(c,say)=>{say(scanCode(c)?`Added: ${c}`:`Not added: ${c}`)});
  if(!ok)closeModal();
+ }catch(e){console.error(e);stopCamera();closeModal();toast("Scanner error: "+(e&&e.message||e))}
 }
 // Add/Edit product: fill the Barcode field from the camera without leaving the form.
 async function scanIntoBarcode(){
+ try{
  const box=$("#fBarcodeCam"),input=$("#fBarcode");if(!box||!input)return;
  if(box.style.display==="block"){stopCamera();box.style.display="none";return}
  box.style.display="block";
- const ok=await startCamScan($("#fBarcodeVideo"),$("#fBarcodeStatus"),(c)=>{input.value=c;beep(true);stopCamera();box.style.display="none";toast(`Barcode captured: ${c}`);input.focus()});
+ const ok=await startCamScan($("#fBarcodeVideo"),$("#fBarcodeStatus"),(c)=>{const inp=$("#fBarcode"),bx=$("#fBarcodeCam");if(!inp)return;inp.value=c;beep(true);stopCamera();if(bx)bx.style.display="none";toast(`Barcode captured: ${c}`);inp.focus()});
  if(!ok)box.style.display="none";
+ }catch(e){console.error(e);stopCamera();const b=$("#fBarcodeCam");if(b)b.style.display="none";toast("Scanner error: "+(e&&e.message||e))}
 }
 // If the cashier clicked elsewhere, the first scanned character moves focus back to the search box.
 document.addEventListener("keydown",e=>{
