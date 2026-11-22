@@ -218,6 +218,9 @@ app.post("/api/auth/signup",signupLimiter,(req,res)=>{
    const salt=crypto.randomBytes(16).toString("hex");
    const info=db.prepare("INSERT INTO users(name,username,password_hash,salt,role) VALUES(?,?,?,?,?)").run(name,username,scrypt(password,salt),salt,"admin");
    db.prepare("INSERT INTO settings(key,value) VALUES('business_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(shopName);
+   const addr=String(b.shop_address||"").trim().slice(0,160),phone=String(b.shop_phone||"").trim().slice(0,40);
+   if(addr)db.prepare("INSERT INTO settings(key,value) VALUES('business_address',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(addr);
+   if(phone)db.prepare("INSERT INTO settings(key,value) VALUES('business_phone',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(phone);
    createSession(res,info.lastInsertRowid);
   });
   res.status(201).json({ok:true,shop:slug});

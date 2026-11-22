@@ -179,7 +179,7 @@ function receiptHtml(s,items,mm){
  const w58=mm===58,printable=w58?"48mm":"72mm",fs=w58?11:12;
  const when=s.created_at?new Date(String(s.created_at).replace(" ","T")+"Z"):new Date();
  const row=(a,b,cls="")=>`<div class="r ${cls}"><span>${a}</span><span>${b}</span></div>`;
- const lines=items.map(x=>{const name=x.name??x.product_name,qty=+x.quantity,unit=+(x.unit_price??x.price),total=x.line_total!==undefined?+x.line_total:unit*qty;return `<div class="it"><div>${name}</div>${row(`${qty} × ${money(unit)}`,money(total))}</div>`}).join("");
+ const lines=items.map(x=>{const name=esc(x.name??x.product_name),qty=+x.quantity,unit=+(x.unit_price??x.price),total=x.line_total!==undefined?+x.line_total:unit*qty;return `<div class="it"><div>${name}</div>${row(`${qty} × ${money(unit)}`,money(total))}</div>`}).join("");
  const n=v=>Number(v||0);
  const extra=(n(s.discount)>0||n(s.tax)>0)?row("Subtotal",money(n(s.total)+n(s.discount)-n(s.tax)))+(n(s.discount)>0?row("Discount","−"+money(s.discount)):"")+(n(s.tax)>0?row("Tax",money(s.tax)):""):"";
  return `<!doctype html><html><head><meta charset="utf-8"><title>${s.receipt_no}</title><style>
@@ -191,12 +191,14 @@ body{width:${printable};margin:0 auto;padding:3mm 0 8mm;font:${fs}px/1.35 "Couri
 .it{margin:3px 0}.it>div:first-child{word-break:break-word}.b{font-weight:700}.tot{font-size:${fs+2}px}
 hr{border:0;border-top:1px dashed #000;margin:5px 0}p{margin:2px 0}
 </style></head><body>
-<div class="c"><div class="shop">${shopSettings.business_name}</div>${shopSettings.business_address?`<div class="sm">${shopSettings.business_address}</div>`:""}${shopSettings.business_phone?`<div class="sm">Tel: ${shopSettings.business_phone}</div>`:""}<p>SALES RECEIPT</p></div><hr>
-<p>Receipt: ${s.receipt_no}<br>Date: ${when.toLocaleString()}<br>Cashier: ${s.cashier||""}</p><hr>
+<div class="c"><div class="shop">${esc(shopSettings.business_name)}</div>${shopSettings.business_address?`<div class="sm">${esc(shopSettings.business_address)}</div>`:""}${shopSettings.business_phone?`<div class="sm">Tel: ${esc(shopSettings.business_phone)}</div>`:""}<p>SALES RECEIPT</p></div><hr>
+<p>Receipt: ${esc(s.receipt_no)}<br>Date: ${when.toLocaleDateString()}<br>Time: ${when.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}<br>Cashier: ${esc(s.cashier||"")}</p><hr>
 ${lines}<hr>${extra}
 ${row("Total",money(s.total),"b tot")}${row(s.payment_method?`Paid (${s.payment_method})`:"Paid",money(s.amount_paid))}${n(s.change_due)>0?row("Change",money(s.change_due)):""}${n(s.balance_due)>0?row("Balance due",money(s.balance_due),"b"):""}
-${shopSettings.receipt_footer?`<hr><p class="c">${shopSettings.receipt_footer}</p>`:""}</body></html>`}
-function printReceipt(s,items=[]){
+${shopSettings.receipt_footer?`<hr><p class="c">${esc(shopSettings.receipt_footer)}</p>`:""}</body></html>`}
+async function printReceipt(s,items=[]){
+ await loadSettings();
+ if(!shopSettings.business_address)toast("Tip: add your pharmacy address in Settings so it prints on receipts.");
  const mm=getPaperMm(),html=receiptHtml(s,items,mm);
  document.getElementById("receiptFrame")?.remove();
  const f=document.createElement("iframe");f.id="receiptFrame";f.setAttribute("aria-hidden","true");f.setAttribute("title","Receipt");
@@ -219,10 +221,10 @@ async function settingsPage(){
  await loadSettings();
  const canEdit=currentUser?.role==="admin"||currentUser?.role==="manager",dis=canEdit?"":"disabled",box='style="max-width:260px;border:1px solid var(--line);border-radius:6px;padding:9px"';
  $("#content").innerHTML=heading("Settings","Configure the business profile and system preferences.")+`<div class="panel"><div class="panel-head"><h3>Business profile</h3><span class="status">Shown on receipts</span></div>
- <div class="settings-row"><div><b>Business name</b><p>Printed at the top of every receipt.</p></div><input id="sName" maxlength="80" value="${shopSettings.business_name}" ${dis} ${box}></div>
- <div class="settings-row"><div><b>Address</b><p>Optional. Printed under the name.</p></div><input id="sAddr" maxlength="160" value="${shopSettings.business_address}" ${dis} ${box}></div>
- <div class="settings-row"><div><b>Phone</b><p>Optional.</p></div><input id="sPhone" maxlength="40" value="${shopSettings.business_phone}" ${dis} ${box}></div>
- <div class="settings-row"><div><b>Receipt footer</b><p>Message at the bottom of the receipt. Leave empty for none.</p></div><input id="sFoot" maxlength="160" value="${shopSettings.receipt_footer}" ${dis} ${box}></div>
+ <div class="settings-row"><div><b>Business name</b><p>Printed at the top of every receipt.</p></div><input id="sName" maxlength="80" value="${esc(shopSettings.business_name)}" ${dis} ${box}></div>
+ <div class="settings-row"><div><b>Address</b><p>Optional. Printed under the name.</p></div><input id="sAddr" maxlength="160" value="${esc(shopSettings.business_address)}" ${dis} ${box}></div>
+ <div class="settings-row"><div><b>Phone</b><p>Optional.</p></div><input id="sPhone" maxlength="40" value="${esc(shopSettings.business_phone)}" ${dis} ${box}></div>
+ <div class="settings-row"><div><b>Receipt footer</b><p>Message at the bottom of the receipt. Leave empty for none.</p></div><input id="sFoot" maxlength="160" value="${esc(shopSettings.receipt_footer)}" ${dis} ${box}></div>
  <div class="settings-row"><div><b>${canEdit?"Save business profile":"Business profile"}</b><p>${canEdit?"Applies to every device.":"Only an administrator or manager can change these."}</p></div>${canEdit?`<button class="btn" onclick="saveShopSettings()">Save</button>`:""}</div>
  <div class="panel-head" style="margin-top:18px"><h3>Receipt printer (this device)</h3></div>
  <div class="settings-row"><div><b>Paper width</b><p>Choose the roll width of the printer connected to this computer. Saved in this browser only, so each till can use its own printer.</p></div><select id="sPaper" ${box} onchange="setPaperMm(this.value);toast('Paper width saved for this device.')"><option value="80" ${getPaperMm()===80?"selected":""}>80 mm roll</option><option value="58" ${getPaperMm()===58?"selected":""}>58 mm roll</option></select></div>
@@ -292,7 +294,7 @@ function showAuth(signup,shopCode){
  authMode=signup?"signup":"login";
  const set=(id,v)=>{const el=$(id);if(el)el.hidden=v};
  $("#authScreen").classList.add("show");
- set("#shopNameField",!signup);set("#nameField",!signup);
+ set("#shopNameField",!signup);set("#shopAddrField",!signup);set("#shopPhoneField",!signup);set("#nameField",!signup);
  $("#authTitle").textContent=signup?"Create your shop":"Welcome back";
  $("#authDesc").textContent=signup?"Start a free 14-day trial. You will be the shop's administrator.":"Sign in with your shop code, username and password.";
  $("#authSubmit").textContent=signup?"Create my shop":"Sign in";
@@ -304,7 +306,7 @@ function showAuth(signup,shopCode){
 function showWorkspace(){$("#authScreen").classList.remove("show");$("#sidebar .user-mini b").textContent=currentUser.name;$("#sidebar .user-mini small").textContent=currentUser.role;["finance","reports","inventory","purchases","returns"].forEach(p=>{const n=document.querySelector(`[data-page="${p}"]`);if(n)n.hidden=currentUser.role==="cashier"});const supplierPayNote=document.querySelector(`[data-page="credit"]`);if(supplierPayNote)supplierPayNote.hidden=false;loadSettings();setPage("dashboard");}
 $("#authForm").addEventListener("submit",async e=>{e.preventDefault();
  const body={shop:$("#authShop").value.trim().toLowerCase(),username:$("#authUser").value.trim(),password:$("#authPass").value};
- if(authMode==="signup"){body.shop_name=$("#authShopName").value.trim();body.name=$("#authName").value.trim();if(!body.shop)delete body.shop}
+ if(authMode==="signup"){body.shop_name=$("#authShopName").value.trim();body.shop_address=($("#authShopAddr")?.value||"").trim();body.shop_phone=($("#authShopPhone")?.value||"").trim();body.name=$("#authName").value.trim();if(!body.shop)delete body.shop}
  try{const r=await originalApi(authMode==="signup"?"/auth/signup":"/auth/login",{method:"POST",body:JSON.stringify(body)});
   try{localStorage.setItem("shopflow_shop",authMode==="signup"?(r.shop||body.shop):body.shop)}catch{}
   currentUser=await originalApi("/auth/me");$("#authPass").value="";showWorkspace()}catch(err){toast(err.message)}});
